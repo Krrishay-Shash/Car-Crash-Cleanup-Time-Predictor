@@ -1,0 +1,270 @@
+```{r all-severity-levels}
+# Load required libraries
+library(tidyverse)
+library(lubridate)
+library(ranger)
+library(pROC)
+library(knitr)
+library(ggplot2)
+
+set.seed(42)
+
+# ------------------------------------------------------------------------------
+# 1. Load Data & Prepare Binary Target Variable
+# ------------------------------------------------------------------------------
+cat("Loading and preparing dataset...\n")
+
+raw_accidents <- read_csv(
+  "US_Accidents_March23_sampled_500k.csv",
+  show_col_types = FALSE
+) %>%
+  slice_sample(n = 100000) %>%
+  mutate(
+    # Parse Timestamps & Calculate Duration Target (Minutes)
+    Start_Time = parse_date_time(Start_Time, orders = c("ymd HMS", "ymd HM", "ymd"), tz = "UTC"),
+    End_Time   = parse_date_time(End_Time, orders = c("ymd HMS", "ymd HM", "ymd"), tz = "UTC"),
+    Duration_mins = as.numeric(difftime(End_Time, Start_Time, units = "mins")),
+    
+    # Define Binary Target (Factor with valid R variable names)
+    Duration_Category = factor(
+      if_else(Duration_mins >= 120, "Over_2_Hours", "Under_2_Hours"),
+      levels = c("Under_2_Hours", "Over_2_Hours")
+    ),
+    
+    # Feature Engineering
+    Hour = hour(Start_Time),
+    Day_of_Week = wday(Start_Time, label = TRUE),
+    Is_Rush_Hour = factor(if_else(Hour %in% c(7, 8, 9, 16, 17, 18), "Yes", "No")),
+    
+    # Predictors
+    Temperature = `Temperature(F)`,
+    Humidity = `Humidity(%)`,
+    Visibility = `Visibility(mi)`,
+    Precipitation = coalesce(`Precipitation(in)`, 0),
+    Distance = `Distance(mi)`,
+    Severity_factor = factor(Severity),
+    
+    # Categorical Variables
+    State = fct_lump_n(factor(State), n = 15),
+    Junction = factor(Junction),
+    Traffic_Signal = factor(Traffic_Signal),
+    Crossing = factor(Crossing)
+  ) %>%
+  # Remove clear duration outlier records
+  filter(Duration_mins >= 2 & Duration_mins <= 1440)
+
+# ------------------------------------------------------------------------------
+# 2. Dataset Setup
+# ------------------------------------------------------------------------------
+# Dataset 1: Full Dataset (Includes Severity)
+data_full <- raw_accidents %>%
+  select(
+    Duration_Category, Severity_factor, Hour, Day_of_Week, Is_Rush_Hour, 
+    State, Distance, Temperature, Humidity, Visibility, Precipitation,
+    Junction, Traffic_Signal, Crossing
+  ) %>%
+  drop_na()
+
+# Dataset 2: Severity 2 Crashes Only
+data_sev2 <- raw_accidents %>%
+  filter(Severity == 2) %>%
+  select(
+    Duration_Category, Hour, Day_of_Week, Is_Rush_Hour, 
+    State, Distance, Temperature, Humidity, Visibility, Precipitation,
+    Junction, Traffic_Signal, Crossing
+  ) %>%
+  drop_na()
+
+# ------------------------------------------------------------------------------
+# 3. Train / Test Splits (80/20 Stratified)
+# ------------------------------------------------------------------------------
+train_idx_1 <- sample(seq_len(nrow(data_full)), size = 0.8 * nrow(data_full))
+train_full  <- data_full[train_idx_1, ]
+test_full   <- data_full[-train_idx_1, ]
+
+train_idx_2 <- sample(seq_len(nrow(data_sev2)), size = 0.8 * nrow(data_sev2))
+train_sev2  <- data_sev2[train_idx_2, ]
+test_sev2   <- data_sev2[-train_idx_2, ]
+
+# ------------------------------------------------------------------------------
+# 4. Train Both Binary Random Forest Classifiers
+# ------------------------------------------------------------------------------
+cat("Training Model 1 (All Crashes with Severity Factor)...\n")
+fit_rf_model1 <- ranger(
+  formula = Duration_Category ~ .,
+  data = train_full,
+  num.trees = 300,
+  probability = TRUE,     # Return class probabilities for ROC/AUC
+  importance = "impurity",
+  seed = 42
+)
+
+cat("Training Model 2 (Severity Level 2 Subset Only)...\n")
+fit_rf_model2 <- ranger(
+  formula = Duration_Category ~ .,
+  data = train_sev2,
+  num.trees = 300,
+  probability = TRUE,     # Return class probabilities for ROC/AUC
+  importance = "impurity",
+  seed = 42
+)
+
+cat("Both binary models trained successfully!\n\n")
+
+# ------------------------------------------------------------------------------
+# 5. Evaluate Performance & Compute Binary Classification Metrics
+# ------------------------------------------------------------------------------
+evaluate_binary_rf <- function(model_obj, test_data, model_name) {
+  # Predict probabilities
+  prob_preds <- predict(model_obj, data = test_data)$predictions[, "Over_2_Hours"]
+  actual_class <- test_data$Duration_Category
+  
+  # Predicted class at 0.5 threshold
+  pred_class <- factor(
+    if_else(prob_preds >= 0.5, "Over_2_Hours", "Under_2_Hours"),
+    levels = c("Under_2_Hours", "Over_2_Hours")
+  )
+  
+  # Compute ROC and metrics
+  roc_obj  <- roc(actual_class, prob_preds, levels = c("Under_2_Hours", "Over_2_Hours"), quiet = TRUE)
+  auc_val  <- as.numeric(auc(roc_obj))
+  
+  cm <- table(Actual = actual_class, Predicted = pred_class)
+  
+  tp <- cm["Over_2_Hours", "Over_2_Hours"]
+  tn <- cm["Under_2_Hours", "Under_2_Hours"]
+  fp <- cm["Under_2_Hours", "Over_2_Hours"]
+  fn <- cm["Over_2_Hours", "Under_2_Hours"]
+  
+  acc <- (tp + tn) / sum(cm)
+  sens <- tp / (tp + fn)  # True Positive Rate (Recall)
+  spec <- tn / (tn + fp)  # True Negative Rate
+  
+  list(
+    metrics = tibble(
+      Model = model_name,
+      `Test Sample` = nrow(test_data),
+      `ROC-AUC` = round(auc_val, 4),
+      `Accuracy` = paste0(round(acc * 100, 2), "%"),
+      `Sensitivity (Recall)` = paste0(round(sens * 100, 2), "%"),
+      `Specificity` = paste0(round(spec * 100, 2), "%")
+    ),
+    roc = roc_obj
+  )
+}
+
+res1 <- evaluate_binary_rf(fit_rf_model1, test_full, "Model 1: All Crashes (+ Severity)")
+res2 <- evaluate_binary_rf(fit_rf_model2, test_sev2, "Model 2: Severity 2 Only")
+
+cat("=================================================================================\n")
+cat("            BINARY CLASSIFICATION COMPARISON: OVER/UNDER 2 HOURS                 \n")
+cat("=================================================================================\n")
+print(knitr::kable(bind_rows(res1$metrics, res2$metrics), align = "lccccc"))
+
+# ------------------------------------------------------------------------------
+# 6. Plot ROC Curves Side-by-Side Comparison
+# ------------------------------------------------------------------------------
+roc_df1 <- tibble(
+  fpr = 1 - res1$roc$specificities,
+  tpr = res1$roc$sensitivities,
+  Model = paste0("Model 1: All Crashes (AUC = ", sprintf("%.3f", res1$roc$auc), ")")
+)
+
+roc_df2 <- tibble(
+  fpr = 1 - res2$roc$specificities,
+  tpr = res2$roc$sensitivities,
+  Model = paste0("Model 2: Severity 2 Only (AUC = ", sprintf("%.3f", res2$roc$auc), ")")
+)
+
+bind_rows(roc_df1, roc_df2) %>%
+  ggplot(aes(x = fpr, y = tpr, color = Model)) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "gray60") +
+  geom_line(linewidth = 1.1) +
+  scale_color_manual(values = c("#2b5c8f", "#2e8b57")) +
+  scale_x_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  scale_y_continuous(limits = c(0, 1), expand = c(0, 0)) +
+  coord_equal() +
+  labs(
+    title = "ROC Curve Comparison: Binary Crash Duration Models",
+    subtitle = "Predicting long-duration crashes (Over 2 Hours)",
+    x = "False Positive Rate (1 - Specificity)",
+    y = "True Positive Rate (Sensitivity)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    legend.position = "bottom"
+  )
+```
+
+```{r}
+# Load required libraries
+library(tidyverse)
+library(ggplot2)
+
+# ------------------------------------------------------------------------------
+# 1. Extract Feature Importances & Compute Relative Percentages
+# ------------------------------------------------------------------------------
+get_binary_importance_df <- function(model_obj, model_label) {
+  tibble(
+    Predictor = names(model_obj$variable.importance),
+    Importance = model_obj$variable.importance,
+    Model = model_label
+  ) %>%
+    mutate(
+      # Normalize values to total 100% relative importance
+      Rel_Importance = (Importance / sum(Importance)) * 100
+    )
+}
+
+# Combine importance metrics from both binary classification models
+importance_binary_combined <- bind_rows(
+  get_binary_importance_df(fit_rf_model1, "Model 1: All Crashes (+ Severity)"),
+  get_binary_importance_df(fit_rf_model2, "Model 2: Severity 2 Subset Only")
+)
+
+# ------------------------------------------------------------------------------
+# 2. Plot Side-by-Side Relative Feature Importance Graphs
+# ------------------------------------------------------------------------------
+# Use facets so the comparison only depends on ggplot2.
+combined_importance_plot <- importance_binary_combined %>%
+  ggplot(
+    aes(
+      x = reorder(Predictor, Rel_Importance),
+      y = Rel_Importance,
+      fill = Model
+    )
+  ) +
+  geom_col(width = 0.75, show.legend = FALSE) +
+  geom_text(
+    aes(label = sprintf("%.1f%%", Rel_Importance)),
+    hjust = -0.1,
+    size = 3.5,
+    color = "gray20"
+  ) +
+  coord_flip() +
+  facet_wrap(~ Model, nrow = 1, scales = "free_y") +
+  scale_fill_manual(
+    values = c(
+      "Model 1: All Crashes (+ Severity)" = "#2b5c8f",
+      "Model 2: Severity 2 Subset Only" = "#2e8b57"
+    )
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Binary Random Forest Feature Importance Comparison",
+    subtitle = "Gini impurity reduction across 300 classification trees per model",
+    x = "Predictor Variable",
+    y = "Relative Importance (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title = element_text(size = 16, face = "bold"),
+    strip.text = element_text(face = "bold"),
+    panel.grid.major.y = element_blank()
+  )
+
+print(combined_importance_plot)
+```

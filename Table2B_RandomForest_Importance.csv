@@ -1,0 +1,11 @@
+Rank,Predictor,Relative Importance (%)
+1,Distance,42.67
+2,Temperature,14.16
+3,Humidity,12.95
+4,Hour,7.48
+5,State,6.91
+6,Day_of_Week,6.17
+7,Visibility,3.75
+8,Precipitation,1.73
+9,Traffic_Signal,1.21
+10,Is_Rush_Hour,1.09
